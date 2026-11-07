@@ -1,4 +1,4 @@
-# CI for a Coworld game repo (Metta-AI/cogame-ledger).
+# CI for a Coworld game repo (softmax-universe/cogame-ledger).
 #
 # Goes to:  .github/workflows/ci.yml  in the coworld repo.
 # Substitute: ledger  (lowercase game slug, e.g. bullwhip)

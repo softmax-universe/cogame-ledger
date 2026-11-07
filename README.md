@@ -137,8 +137,8 @@ Releases go through `.github/workflows/coworld-release.yml`
 ## Licence
 
 MIT. See [`LICENSE`](LICENSE). Forked from
-[`Metta-AI/cogame-babel`](https://github.com/Metta-AI/cogame-babel); the floor
-and font assets come from [`Metta-AI/coworld-ctf`](https://github.com/Metta-AI/coworld-ctf).
+[`softmax-universe/cogame-babel`](https://github.com/softmax-universe/cogame-babel); the floor
+and font assets come from [`softmax-universe/coworld-ctf`](https://github.com/softmax-universe/coworld-ctf).
 
 Player sockets must deliver a valid prompt/scripted or external profile before
 they can trigger model calls. Startup waits for profiles within the existing
