@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -199,7 +200,7 @@ def run_certify(manifest_path: Path, cmd_template: list[str]) -> int:
                 if src_bundle.exists():
                     dst_bundle = temp_dir / bundle
                     dst_bundle.parent.mkdir(parents=True, exist_ok=True)
-                    dst_bundle.symlink_to(src_bundle)
+                    shutil.copytree(src_bundle, dst_bundle)
             for p in temp_manifest.get("player") or []:
                 env = p.setdefault("env", {})
                 if env.get("COWORLD_LLM_ENABLED") == "true":
