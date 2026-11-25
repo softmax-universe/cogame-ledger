@@ -318,6 +318,40 @@ suite "llm plumbing, offline":
     expect LedgerError:
       discard extractJsonObject("I would rather not answer that.")
 
+  test "canonical single-fence JSON reader accepts bare or single fenced object without inventing actions":
+    let bare = parseSingleFencedJson("""{"move": "cooperate", "note": "fair", "memo": "ok"}""")
+    check parseDecision(sgDilemma, true, bare).move == MoveCooperate
+    let fencedJson = parseSingleFencedJson("```json\n{\"move\": 50, \"note\": \"\", \"memo\": \"\"}\n```")
+    check parseDecision(sgTrust, false, fencedJson).move == 50
+    let fencedPlain = parseSingleFencedJson("```\n{\"move\": 6}\n```")
+    check parseDecision(sgUltimatum, true, fencedPlain).move == 6
+    expect LedgerError:
+      discard parseSingleFencedJson("Here is my answer:\n```json\n{\"move\": 6}\n```")
+    expect LedgerError:
+      discard parseSingleFencedJson("```json\n{\"move\": 6}\n```\n```json\n{\"move\": 4}\n```")
+    expect LedgerError:
+      discard parseSingleFencedJson("not json at all")
+    expect LedgerError:
+      discard parseDecision(sgDilemma, true, parseSingleFencedJson("""{"note": "missing move"}"""))
+
+  test "observation prompt builders cover all roles and newPlayerLlmClient requires credentials":
+    var sim = initSim(fixture(7, 6))
+    sim.beginRound()
+    for seat in 0 ..< Seats:
+      let obs = observationJson(sim, seat)
+      let sysP = observationSystemPrompt(obs)
+      let usrP = observationUserPrompt(obs, "Play fairly.")
+      check obs["name"].getStr() in sysP
+      check obs["partner"].getStr() in usrP
+      check "Play fairly." in usrP
+    putEnv("COWORLD_LLM_ENDPOINT", "")
+    putEnv("ANTHROPIC_API_KEY", "")
+    putEnv("ANTHROPIC_API_KEY_URI", "")
+    putEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "")
+    putEnv("AWS_BEARER_TOKEN_BEDROCK", "")
+    expect LedgerError:
+      discard newPlayerLlmClient()
+
   test "note and memo are truncated on rune boundaries and stay one line":
     var long = ""
     for _ in 0 ..< 400:

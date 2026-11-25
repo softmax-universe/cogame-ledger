@@ -47,14 +47,20 @@ Design note: [`docs/plans/2026-08-23-ledger-design.md`](docs/plans/2026-08-23-le
 ## Fielding a policy
 
 The game sends each externally controlled policy its seat's current meeting,
-public record, private memo, and legal move range. The policy returns a
-complete action. The game applies simultaneous moves and owns scoring,
-validation, fallback, and replay.
+public record, private memo, and legal move range. The bundled model player
+(`ledger-player`) sets `COWORLD_LLM_ENABLED=true` and `COWORLD_LLM_MODEL`,
+calling the routed LLM via `COWORLD_LLM_ENDPOINT` inside the player container
+and returning a complete action over `ledger.player.v2`. The game applies
+simultaneous moves and owns scoring, validation, and replay. Missing or invalid
+model actions terminate the episode as an explicit player failure
+(`COGAME_PLAYER_FAILURE_URI`, non-zero exit, no scores).
 
 ```bash
 coworld upload-policy coworld-ledger:latest \
   --name my-ledger \
   --run /bin/ledger-player \
+  --secret-env COWORLD_LLM_ENABLED=true \
+  --secret-env COWORLD_LLM_MODEL=anthropic/claude-haiku-4.5 \
   --secret-env PLAYER_PROMPT="Read the partner record before you trust ..."
 ```
 
@@ -66,21 +72,21 @@ their own right:
 | `mirror`          | Reciprocal with forgiveness. Cooperates first, then plays back the partner's most recent public dilemma move; forgives a single lapse one time in five. Invests 4 and returns 50% against a clean halo, 1 and 25% against a dirty one. Offers 5, holds a floor of 4. |
 | `shark`           | The greedy foil reputation is supposed to punish. Always defects, sends 0 and returns 0, offers 1 and accepts almost anything.                                                                                                                                       |
 
-Any non-empty `PLAYER_SCRIPTED` value other than `shark` means `mirror`.
+Unknown `PLAYER_SCRIPTED` values are rejected.
 
-The certification roster starts with mirror so the five automatic legacy smoke
-games select the scripted baseline. The original six-round certificate still
-covers all three bundled policies, including three native prompt seats.
-The game uses its `mirror` fallback if a player misses the action
-deadline. Invalid actions are parsed and clamped by the game.
+The certification roster seats both the bundled model player (`ledger-player`,
+3 seats) and both explicit scripted baselines (`ledger-mirror` and
+`ledger-shark`, 5 seats). If a model player fails to deliver a valid action,
+the episode terminates via `COGAME_PLAYER_FAILURE_URI` with no scores.
+Numeric moves outside the legal range are clamped by the game.
 
 ## Layout
 
 ```
 src/ledger/sim.nim        the pure rules: schedule, payoff kernels, median,
                           conduct, gossip, ring detection, replay. No IO.
-src/ledger/llm.nim        one parallel batch of eight calls per round, a single
-                          retry sub-batch, then the scripted fallback.
+src/ledger/llm.nim        model prompt composition, single-fence JSON parsing,
+                          learner-container LLM client, and legacy server batch.
 src/ledger/server.nim     the Coworld game contract and the round loop.
 src/ledger/types.nim      config, events, the subgame enum.
 src/ledger.nim            the game entrypoint  (/bin/ledger)
