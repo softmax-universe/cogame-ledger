@@ -190,8 +190,16 @@ def run_certify(manifest_path: Path, cmd_template: list[str]) -> int:
 
     try:
         with tempfile.TemporaryDirectory(prefix="ledger-certify-") as tmpdir:
-            temp_manifest_path = Path(tmpdir) / "coworld_manifest.json"
+            temp_dir = Path(tmpdir)
+            temp_manifest_path = temp_dir / "coworld_manifest.json"
             temp_manifest = json.loads(json.dumps(manifest))
+            bundle = ((temp_manifest.get("game") or {}).get("replay_viewer") or {}).get("bundle")
+            if isinstance(bundle, str) and bundle and not os.path.isabs(bundle):
+                src_bundle = (manifest_path.parent / bundle).resolve()
+                if src_bundle.exists():
+                    dst_bundle = temp_dir / bundle
+                    dst_bundle.parent.mkdir(parents=True, exist_ok=True)
+                    dst_bundle.symlink_to(src_bundle)
             for p in temp_manifest.get("player") or []:
                 env = p.setdefault("env", {})
                 if env.get("COWORLD_LLM_ENABLED") == "true":
