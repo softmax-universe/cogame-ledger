@@ -217,6 +217,7 @@ suite "llm plumbing, offline":
     check not observation.hasKey("memos")
 
   test "with no credentials every seat is scripted, instantly, over no wire":
+    putEnv("COWORLD_LLM_ENDPOINT", "")
     putEnv("ANTHROPIC_API_KEY", "")
     putEnv("ANTHROPIC_API_KEY_URI", "")
     putEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "")
@@ -245,6 +246,33 @@ suite "llm plumbing, offline":
       check decision.note.len == 0
     echo "decideAll with no credentials: ", elapsed, " ms"
     check elapsed < 1000
+
+  test "configured model transport raises ModelDecisionError instead of inventing a move":
+    putEnv("COWORLD_LLM_ENDPOINT", "http://127.0.0.1:1")
+    putEnv("COWORLD_LLM_MODEL", "local/unreachable")
+    defer:
+      putEnv("COWORLD_LLM_ENDPOINT", "")
+      putEnv("COWORLD_LLM_MODEL", "")
+    var config = fixture(3, 6)
+    config.llmTimeoutSeconds = 5
+    let client = newLlmClient(config, PromptSelection())
+    check not client.disabled
+    var sim = initSim(config)
+    sim.beginRound()
+    var seats: seq[int]
+    var scripted = allOf(skMirror)
+    scripted[2] = skNone
+    for seat in 0 ..< Seats:
+      seats.add(seat)
+    var failedSeat = -1
+    var failedMsg = ""
+    try:
+      discard client.decideAll(sim, seats, newSeq[string](Seats), scripted)
+    except ModelDecisionError as error:
+      failedSeat = error.seat
+      failedMsg = error.msg
+    check failedSeat == 2
+    check "seat 2 model decision failed" in failedMsg
 
   test "replies parse tolerantly and clamp instead of failing":
     ## DILEMMA words, in any case, plus the integer encodings.
