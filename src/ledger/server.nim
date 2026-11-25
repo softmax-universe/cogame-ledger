@@ -335,10 +335,13 @@ proc failEpisode(runtimeConfig: RuntimeConfig, failedSeat: int, message: string)
       "seat " & $failedSeat & " failed to produce a valid decision"
     else:
       cleanText(singleLine(message), MaxPlayerFailureMessageLen)
+  var partialReplay = ""
   withLock stateLock:
     if state.finished:
       return
     state.finished = true
+    if state.sim.events.len > 0:
+      partialReplay = state.replayPayload(newJNull())
   echo "ledger: terminal failure for seat ", failedSeat, ": ", cleanMsg
   let failurePayload = $ %*{
     "failed_policy_index": failedSeat,
@@ -349,6 +352,14 @@ proc failEpisode(runtimeConfig: RuntimeConfig, failedSeat: int, message: string)
       state.capture.failCapture(failedSeat, cleanMsg)
     except CatchableError as error:
       state.capture.captureGap(-1, failedSeat, error.msg)
+  if partialReplay.len > 0 and runtimeConfig.replayUri.len > 0:
+    try:
+      writeArtifact(
+        runtimeConfig.replayUri, partialReplay, "application/octet-stream",
+        "COGAME_SAVE_REPLAY_METHOD"
+      )
+    except CatchableError as error:
+      echo "ledger: partial replay write failed: ", error.msg
   let failureUri = getEnv(PlayerFailureUriEnv).strip()
   if failureUri.len > 0:
     writeArtifact(
@@ -381,11 +392,20 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         break
       sleep(200)
 
+    var missingSeat = -1
     withLock stateLock:
-      state.started = true
-      echo "ledger: starting with ", state.playerSockets.len, "/",
-        config.tokens.len, " players connected"
-      state.broadcastLocked()
+      for seat in 0 ..< Seats:
+        if not state.policyReady[seat] or not state.playerSockets.hasKey(seat):
+          missingSeat = seat
+          break
+      if missingSeat < 0:
+        state.started = true
+        echo "ledger: starting with ", state.playerSockets.len, "/",
+          config.tokens.len, " players connected"
+        state.broadcastLocked()
+    if missingSeat >= 0:
+      failEpisode(runtimeConfig, missingSeat,
+        "seat " & $missingSeat & " failed to connect and register a policy before timeout")
 
     let client = newLlmClient(config, promptSelection(parseJson(runtimeConfig.config)))
 
@@ -445,22 +465,33 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var externalCopy: seq[bool]
       var scriptedCopy: seq[ScriptKind]
       var readyCopy: seq[bool]
+      var connectedCopy = newSeq[bool](Seats)
       withLock stateLock:
         simCopy = state.sim
         promptsCopy = state.prompts
         externalCopy = state.external
         scriptedCopy = state.scripted
         readyCopy = state.policyReady
-      # A socket/token is not a delivered policy. Preserve persistent state so
-      # a late valid profile applies on the next round snapshot.
+        for seat in seats:
+          connectedCopy[seat] = state.playerSockets.hasKey(seat)
+
       for seat in seats:
-        if not readyCopy[seat]: scriptedCopy[seat] = skMirror
+        if not readyCopy[seat]:
+          failEpisode(runtimeConfig, seat,
+            "seat " & $seat & " has no registered policy")
+        if not connectedCopy[seat]:
+          failEpisode(runtimeConfig, seat,
+            "seat " & $seat & " disconnected before round " & $(simCopy.round + 1))
 
       var llmSeats = 0
+      var serverSeats: seq[int]
       for seat in seats:
-        if externalCopy[seat] or
-            scriptedCopy[seat] == skNone and not client.disabled:
+        if externalCopy[seat]:
           inc llmSeats
+        else:
+          serverSeats.add(seat)
+          if scriptedCopy[seat] == skNone:
+            inc llmSeats
 
       if state.capture != nil:
         try:
@@ -468,13 +499,12 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           var registrations: seq[JsonNode]
           for seat in seats:
             observations.add(observationJson(simCopy, seat))
-            let origin = if not readyCopy[seat]: "unregistered_fallback"
-              elif externalCopy[seat]: "external"
+            let origin =
+              if externalCopy[seat]: "external"
               elif scriptedCopy[seat] != skNone: "scripted"
               else: "native"
-            registrations.add(%*{"registered": readyCopy[seat], "origin": origin,
-              "fallback_reason": (if readyCopy[seat]: newJNull()
-                else: %"unregistered_policy")})
+            registrations.add(%*{"registered": true, "origin": origin,
+              "fallback_reason": newJNull()})
           state.capture.beginCaptureRound(simCopy, observations,
             client.selection.selectionMetadata(), registrations)
         except CatchableError as error: state.capture.captureGap(simCopy.round, -1, error.msg)
@@ -492,19 +522,17 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                 "observation": observationJson(simCopy, seat)
               })
 
-      for seat in seats:
-        if externalCopy[seat]:
-          scriptedCopy[seat] = skMirror
-
-      ## Steps 2-3: ONE parallel batch of eight calls, then a single retry
-      ## sub-batch. A seat still failing terminates the episode via the
-      ## Coworld player-failure lifecycle instead of inventing a move.
-      var decisions: seq[Decision]
-      try:
-        decisions = client.decideAll(simCopy, seats, promptsCopy,
-          scriptedCopy, state.capture)
-      except ModelDecisionError as error:
-        failEpisode(runtimeConfig, error.seat, error.msg)
+      ## Steps 2-3: ONE parallel batch for server-managed seats (scripted or
+      ## game-owned model), no retries and no scripted fallback for model seats.
+      var decisions = newSeq[Decision](Seats)
+      if serverSeats.len > 0:
+        try:
+          let serverDecisions = client.decideAll(simCopy, serverSeats, promptsCopy,
+            scriptedCopy, state.capture)
+          for idx, seat in serverSeats:
+            decisions[seat] = serverDecisions[idx]
+        except ModelDecisionError as error:
+          failEpisode(runtimeConfig, error.seat, error.msg)
 
       let actionDeadline = epochTime() + config.llmTimeoutSeconds.float
       var failedExternalSeat = -1
@@ -727,6 +755,12 @@ proc websocketHandler(
               except CatchableError as parseErr:
                 state.actionErrors[slot] = parseErr.msg
                 raise parseErr
+        elif payload{"type"}.getStr() == "action_error":
+          withLock stateLock:
+            if state.playerSockets.getOrDefault(slot) != websocket: return
+            if state.external[slot] and state.awaiting[slot] and
+                payload{"round"}.getInt(-1) == state.sim.round:
+              state.actionErrors[slot] = payload{"error"}.getStr("model decision failed")
         elif payload{"type"}.getStr() == "prompt":
           if not payload.hasKey("prompt") or payload["prompt"].kind != JString:
             raise newException(LedgerError, "prompt must be a string")

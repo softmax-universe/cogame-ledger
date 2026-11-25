@@ -7,21 +7,18 @@
 ## All eight seats decide simultaneously by rule — trust and ultimatum use the
 ## experimental-economics STRATEGY METHOD, so the second mover commits a
 ## contingent rule before seeing the first mover's move — which means the
-## eight requests go out as ONE parallel batch (curly.makeRequests) per round.
-## Invalid replies are retried as a smaller batch with a corrective hint, and
-## anything still failing raises ModelDecisionError so the server terminates
-## the episode via the Coworld terminal player-failure lifecycle.
+## server-driven requests go out as ONE parallel batch (curly.makeRequests) per
+## round with no retries and no scripted fallback. Missing credentials,
+## transport errors, or unparseable replies raise ModelDecisionError so the
+## server terminates the episode via the Coworld terminal player-failure
+## lifecycle.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal scripted
-## baseline immediately (no retries, no network waits) so offline
-## certification still completes - this fallback is load-bearing. The same
-## scripted bots are also fieldable policies: a player that registers as
-## scripted plays one deliberately, LLM or not.
+## Scripted bots (`mirror` and `shark`) are only used when selected explicitly.
 
 import
   std/[json, math, os, random, strutils, times, unicode],
@@ -71,14 +68,13 @@ type
     throttled*: bool  ## true once a 429 has been seen; the server slows down
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values: "shark" plays the greedy foil, "" plays no
-  ## scripted baseline at all, and ANY other non-empty value means `mirror`
-  ## — a seat that registers scripted without naming a baseline gets the
-  ## reciprocal one rather than an error.
+  ## PLAYER_SCRIPTED values: "" for non-scripted, or explicitly "mirror" / "shark".
   let value = text.strip().toLowerAscii()
   if value.len == 0: skNone
+  elif value == "mirror": skMirror
   elif value == "shark": skShark
-  else: skMirror
+  else: raise newException(LedgerError,
+    "unknown scripted baseline: " & text & " (expected mirror or shark)")
 
 proc resolveApiKey(): string =
   result = getEnv("ANTHROPIC_API_KEY").strip()
@@ -164,7 +160,7 @@ proc newLlmClient*(config: GameConfig, selection: PromptSelection): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "ledger llm: no LLM credentials; using scripted fallback"
+    echo "ledger llm: no LLM credentials configured"
 
 # ---- Scripted baselines -----------------------------------------------------
 
@@ -563,6 +559,9 @@ proc singleLine*(text: string): string =
     else:
       result.add($rune)
 
+proc rawExcerpt(text: string): string =
+  cleanText(text, 160).replace("\n", " ")
+
 proc stripSingleMarkdownFence*(text: string): string =
   ## Strips at most one outer Markdown presentation fence (``` or ```json)
   ## without tolerating arbitrary surrounding prose or multiple fences.
@@ -571,15 +570,19 @@ proc stripSingleMarkdownFence*(text: string): string =
     return trimmed
   let firstNewline = trimmed.find('\n')
   if firstNewline < 0:
-    raise newException(LedgerError, "unterminated markdown fence in response")
+    raise newException(LedgerError,
+      "unterminated markdown fence in response: " & rawExcerpt(text))
   let info = trimmed[3 ..< firstNewline].strip().toLowerAscii()
   if info.len > 0 and info != "json":
-    raise newException(LedgerError, "unsupported markdown fence language: " & info)
+    raise newException(LedgerError,
+      "unsupported markdown fence language (" & info & "): " & rawExcerpt(text))
   if not trimmed.endsWith("```") or trimmed.len < firstNewline + 4:
-    raise newException(LedgerError, "unclosed markdown fence in response")
+    raise newException(LedgerError,
+      "unclosed markdown fence in response: " & rawExcerpt(text))
   let inner = trimmed[firstNewline + 1 ..< trimmed.len - 3].strip()
   if "```" in inner:
-    raise newException(LedgerError, "multiple markdown fences in response")
+    raise newException(LedgerError,
+      "multiple markdown fences in response: " & rawExcerpt(text))
   inner
 
 proc parseSingleFencedJson*(text: string): JsonNode =
@@ -588,23 +591,17 @@ proc parseSingleFencedJson*(text: string): JsonNode =
   let body = stripSingleMarkdownFence(text)
   if body.len == 0 or body[0] != '{' or body[^1] != '}':
     raise newException(LedgerError, "response is not a JSON object: " &
-      cleanText(text, 160).replace("\n", " "))
-  let parsed = parseJson(body)
+      rawExcerpt(text))
+  let parsed =
+    try:
+      parseJson(body)
+    except CatchableError as err:
+      raise newException(LedgerError,
+        "invalid JSON object (" & err.msg & "): " & rawExcerpt(text))
   if parsed.kind != JObject:
-    raise newException(LedgerError, "response JSON must be an object")
+    raise newException(LedgerError,
+      "response JSON must be an object: " & rawExcerpt(text))
   parsed
-
-proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences
-  ## and prose before or after the object.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
-    ## Quote the head of the reply so a hosted log shows WHAT the model sent
-    ## instead of JSON (prose, a refusal, a cut-off analysis...).
-    raise newException(LedgerError, "no JSON object in response: " &
-      cleanText(text, 160).replace("\n", " "))
-  parseJson(text[start .. stop])
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =
@@ -750,35 +747,30 @@ proc decideAll*(
   capture: RuntimeCapture = nil
 ): seq[Decision] =
   ## One decision per seat in `seats`, in order, from ONE parallel batch of
-  ## HTTP requests. With no credentials configured (`client.disabled` at start)
-  ## seats use the scripted baseline so offline certification completes; when an
-  ## LLM transport is configured, any seat still failing after retry raises
-  ## `ModelDecisionError` instead of inventing a move. `prompts` and `scripted`
-  ## are indexed by SEAT.
+  ## HTTP requests (no retries, no scripted fallback for non-scripted seats).
+  ## Only seats explicitly registered as `skMirror` or `skShark` run scripted;
+  ## any non-scripted seat without credentials or with a transport/parse error
+  ## raises `ModelDecisionError`. `prompts` and `scripted` are indexed by SEAT.
   result = newSeq[Decision](seats.len)
-  var open: seq[int]     ## indexes into `seats` still undecided
+  var open: seq[int]     ## indexes into `seats` needing a model call
   var lastErrors = newSeq[string](seats.len)
   for index, seat in seats:
     let kind = scripted[seat]
-    if kind != skNone or client.disabled:
-      result[index] = scriptedAction(sim, seat,
-        (if kind == skNone: skMirror else: kind))
+    if kind != skNone:
+      result[index] = scriptedAction(sim, seat, kind)
+    elif client.disabled:
+      var err = newException(ModelDecisionError,
+        "seat " & $seat & " model decision failed: no LLM credentials configured")
+      err.seat = seat
+      raise err
     else:
       open.add(index)
-  for attempt in 0 .. 1:
-    if open.len == 0 or client.disabled:
-      break
+  if open.len > 0:
+    const attempt = 0
     var batch: RequestBatch
     for index in open:
       let seat = seats[index]
-      let pair = sim.pairIndexOf(sim.round, seat)
-      let meeting = sim.plan.pairs[pair]
-      let first = meeting.a == seat
-      var user = sim.userPrompt(seat, prompts[seat])
-      if attempt > 0:
-        user.add("\nYour previous reply was invalid. Respond with ONLY the " &
-          "requested JSON object, with \"move\" " &
-          legalForm(meeting.game, first) & ".")
+      let user = sim.userPrompt(seat, prompts[seat])
       let request = client.requestFor(systemPrompt(client.selection, sim, seat), user, seat)
       batch.post(request.url, request.headers, request.body, $index)
       if capture != nil:
@@ -807,7 +799,7 @@ proc decideAll*(
           try: capture.decodedText(sim.round, seat, attempt, text)
           except CatchableError as error: capture.captureGap(sim.round, seat, error.msg)
         result[index] = parseDecision(meeting.game, first,
-          extractJsonObject(text))
+          parseSingleFencedJson(text))
         if capture != nil:
           try:
             capture.parsedAttempt(sim.round, seat, attempt, result[index].move,
@@ -819,7 +811,7 @@ proc decideAll*(
           except CatchableError as captureError: capture.captureGap(sim.round, seat, captureError.msg)
         let detail = cleanText(error.msg, 300)
         lastErrors[index] = detail
-        echo "ledger llm: seat ", seat, " attempt ", attempt, " failed: ", detail
+        echo "ledger llm: seat ", seat, " failed: ", detail
         stillOpen.add(index)
     open = stillOpen
   if open.len > 0:

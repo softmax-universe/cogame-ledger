@@ -164,7 +164,7 @@ when isMainModule:
         else: %*{"move": teacher.move})}
     of "step":
       doAssert not game.done and request["decision_id"].getInt() == id
-      let action = if languageMode: extractJsonObject(request["response"].getStr())
+      let action = if languageMode: parseSingleFencedJson(request["response"].getStr())
         else: parseJson(request["response"].getStr())
       let pair = game.pairIndexOf(game.round, seat)
       let meeting = game.plan.pairs[pair]
