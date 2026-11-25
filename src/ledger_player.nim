@@ -6,8 +6,7 @@
 ## prompt to Claude once per round, in one parallel batch with the other seven.
 ##
 ## PLAYER_SCRIPTED names a built-in baseline instead — `mirror` (reciprocal
-## with forgiveness) or `shark` (the greedy foil). Any other non-empty value
-## means `mirror`.
+## with forgiveness) or `shark` (the greedy foil).
 ##
 ## To field your own policy, reuse this image and set PLAYER_PROMPT:
 ##   coworld upload-policy <ledger-image> --name my-ledger \
@@ -33,20 +32,24 @@ alias, what they did to you, and what you intend to do about it.
 """
 
 proc scriptedName(): string =
-  ## PLAYER_SCRIPTED is a NAME, not a flag: "shark" plays the greedy foil and
-  ## any other non-empty value plays the reciprocal `mirror` baseline.
   let raw = getEnv("PLAYER_SCRIPTED").strip()
-  if raw.len == 0: ""
-  elif raw.toLowerAscii() == "shark": "shark"
-  else: "mirror"
+  if raw.len == 0:
+    return ""
+  let lower = raw.toLowerAscii()
+  if lower == "mirror" or lower == "shark":
+    return lower
+  quit("unknown PLAYER_SCRIPTED baseline: " & raw &
+    " (expected mirror or shark)", 1)
 
 when isMainModule:
   let url = getEnv("COWORLD_PLAYER_WS_URL")
   if url.len == 0:
     quit("COWORLD_PLAYER_WS_URL is not set", 1)
   let scripted = scriptedName()
-  var prompt = getEnv("PLAYER_PROMPT")
-  if prompt.len == 0:
+  var prompt =
+    if scripted.len > 0: ""
+    else: getEnv("PLAYER_PROMPT")
+  if scripted.len == 0 and prompt.len == 0:
     prompt = DefaultPrompt
 
   proc promptFrame(): string =
@@ -54,9 +57,6 @@ when isMainModule:
 
   echo "ledger player: connecting to game"
   let socket = newWebSocket(url)
-  socket.send(promptFrame())
-  echo "ledger player: prompt delivered (", prompt.len, " chars",
-    (if scripted.len > 0: ", scripted " & scripted else: ""), ")"
 
   ## whisky's receiveMessage RAISES on a close frame or a truncated read
   ## (only a timeout returns none), and mummy's send only QUEUES, so the
@@ -78,9 +78,9 @@ when isMainModule:
         of "welcome":
           echo "ledger player: seated at slot ", payload{"slot"}.getInt(),
             " as ", payload{"name"}.getStr()
-          ## Re-deliver the prompt after the welcome, in case the first send
-          ## raced the server's slot registration.
           socket.send(promptFrame())
+          echo "ledger player: profile delivered (", prompt.len, " chars",
+            (if scripted.len > 0: ", scripted " & scripted else: ""), ")"
         of "final":
           echo "ledger player: final scores ", payload{"scores"}
           break

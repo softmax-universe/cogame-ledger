@@ -9,7 +9,8 @@
 ## contingent rule before seeing the first mover's move — which means the
 ## eight requests go out as ONE parallel batch (curly.makeRequests) per round.
 ## Invalid replies are retried as a smaller batch with a corrective hint, and
-## anything still failing falls back to the `mirror` scripted baseline.
+## anything still failing raises ModelDecisionError so the server terminates
+## the episode via the Coworld terminal player-failure lifecycle.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
@@ -46,6 +47,9 @@ type
     note*: string       ## "" when the reply carried none
     memo*: string       ## "" when the reply carried none
     scripted*: bool     ## decided by a scripted baseline, not by the model
+
+  ModelDecisionError* = object of LedgerError
+    seat*: int
 
   LlmTransport = enum
     ltNone, ltSidecar, ltBedrock, ltAnthropic
@@ -712,11 +716,14 @@ proc decideAll*(
   capture: RuntimeCapture = nil
 ): seq[Decision] =
   ## One decision per seat in `seats`, in order, from ONE parallel batch of
-  ## HTTP requests. Never raises: any failure falls back to the scripted
-  ## baseline so the episode always advances. `prompts` and `scripted` are
-  ## indexed by SEAT.
+  ## HTTP requests. With no credentials configured (`client.disabled` at start)
+  ## seats use the scripted baseline so offline certification completes; when an
+  ## LLM transport is configured, any seat still failing after retry raises
+  ## `ModelDecisionError` instead of inventing a move. `prompts` and `scripted`
+  ## are indexed by SEAT.
   result = newSeq[Decision](seats.len)
   var open: seq[int]     ## indexes into `seats` still undecided
+  var lastErrors = newSeq[string](seats.len)
   for index, seat in seats:
     let kind = scripted[seat]
     if kind != skNone or client.disabled:
@@ -776,11 +783,18 @@ proc decideAll*(
         if capture != nil:
           try: capture.failedAttempt(sim.round, seat, attempt, error.msg)
           except CatchableError as captureError: capture.captureGap(sim.round, seat, captureError.msg)
-        echo "ledger llm: seat ", seat, " attempt ", attempt, " failed: ",
-          cleanText(error.msg, 300)
+        let detail = cleanText(error.msg, 300)
+        lastErrors[index] = detail
+        echo "ledger llm: seat ", seat, " attempt ", attempt, " failed: ", detail
         stillOpen.add(index)
     open = stillOpen
-  for index in open:
-    let seat = seats[index]
-    echo "ledger: seat ", seat, " falling back to scripted decision"
-    result[index] = scriptedAction(sim, seat, skMirror)
+  if open.len > 0:
+    let failedIndex = open[0]
+    let failedSeat = seats[failedIndex]
+    let detail =
+      if lastErrors[failedIndex].len > 0: lastErrors[failedIndex]
+      else: "model failed to produce a valid decision"
+    var err = newException(ModelDecisionError,
+      "seat " & $failedSeat & " model decision failed: " & detail)
+    err.seat = failedSeat
+    raise err

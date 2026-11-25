@@ -36,6 +36,9 @@ import
 const
   MaxPromptLen = 4000
   ReplayVersion = 1
+  PlayerFailureUriEnv = "COGAME_PLAYER_FAILURE_URI"
+  PlayerFailureMethodEnv = "COGAME_PLAYER_FAILURE_METHOD"
+  MaxPlayerFailureMessageLen = 2000
 
   PlayBudgetFraction* = 0.6
     ## Share of the platform's episode timeout spent playing. The rest covers
@@ -325,6 +328,35 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   echo "ledger: episode complete, shutting down"
   quit(0)
 
+proc failEpisode(runtimeConfig: RuntimeConfig, failedSeat: int, message: string) =
+  let cleanMsg =
+    if message.strip().len == 0:
+      "seat " & $failedSeat & " failed to produce a valid decision"
+    else:
+      cleanText(singleLine(message), MaxPlayerFailureMessageLen)
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+  echo "ledger: terminal failure for seat ", failedSeat, ": ", cleanMsg
+  let failurePayload = $ %*{
+    "failed_policy_index": failedSeat,
+    "message": cleanMsg
+  }
+  if state.capture != nil:
+    try:
+      state.capture.failCapture(failedSeat, cleanMsg)
+    except CatchableError as error:
+      state.capture.captureGap(-1, failedSeat, error.msg)
+  let failureUri = getEnv(PlayerFailureUriEnv).strip()
+  if failureUri.len > 0:
+    writeArtifact(
+      failureUri, failurePayload, "application/json",
+      PlayerFailureMethodEnv
+    )
+  echo "ledger: episode failed, shutting down"
+  quit(1)
+
 proc meetingLog(sim: Sim, pair: int): string =
   let meeting = sim.plan.pairs[pair]
   sim.names[meeting.a] & " / " & sim.names[meeting.b] & " " &
@@ -463,11 +495,14 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           scriptedCopy[seat] = skMirror
 
       ## Steps 2-3: ONE parallel batch of eight calls, then a single retry
-      ## sub-batch, then the scripted fallback. The slow part runs outside
-      ## the lock on a snapshot; only this thread mutates the sim, so the
-      ## snapshot cannot go stale.
-      var decisions = client.decideAll(simCopy, seats, promptsCopy,
-        scriptedCopy, state.capture)
+      ## sub-batch. A seat still failing terminates the episode via the
+      ## Coworld player-failure lifecycle instead of inventing a move.
+      var decisions: seq[Decision]
+      try:
+        decisions = client.decideAll(simCopy, seats, promptsCopy,
+          scriptedCopy, state.capture)
+      except ModelDecisionError as error:
+        failEpisode(runtimeConfig, error.seat, error.msg)
 
       let actionDeadline = epochTime() + config.llmTimeoutSeconds.float
       while epochTime() < actionDeadline:
@@ -480,6 +515,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           break
         sleep(20)
 
+      var missedExternalSeat = -1
       withLock stateLock:
         for seat in seats:
           if externalCopy[seat]:
@@ -489,9 +525,11 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               let meeting = state.sim.plan.pairs[pair]
               decisions[seat] = parseDecision(meeting.game,
                 meeting.a == seat, state.actions[seat])
-            else:
-              echo "ledger: seat ", seat,
-                " missed action deadline; using mirror fallback"
+            elif missedExternalSeat < 0:
+              missedExternalSeat = seat
+      if missedExternalSeat >= 0:
+        failEpisode(runtimeConfig, missedExternalSeat,
+          "seat " & $missedExternalSeat & " missed action deadline")
 
       withLock stateLock:
         var moves: array[Meetings, array[2, int]]
@@ -507,28 +545,10 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           notes[seat] = decisions[seat].note
           memos[seat] = decisions[seat].memo
         ## Steps 4-8: one transactional apply.
-        var roundReplayed = false
-        try:
-          state.sim.applyRound(moves, notes, memos, flags)
-        except LedgerError as error:
-          roundReplayed = true
-          echo "ledger: round rejected (", error.msg,
-            "); replaying it on the scripted baseline"
-          var safeMoves: array[Meetings, array[2, int]]
-          var safeFlags: array[Meetings, array[2, bool]]
-          for pair in 0 ..< Meetings:
-            let meeting = state.sim.plan.pairs[pair]
-            safeMoves[pair] = [
-              scriptedAction(state.sim, meeting.a, skMirror).move,
-              scriptedAction(state.sim, meeting.b, skMirror).move]
-            safeFlags[pair] = [true, true]
-          state.sim.applyRound(safeMoves, newSeq[string](Seats),
-            newSeq[string](Seats), safeFlags)
+        state.sim.applyRound(moves, notes, memos, flags)
         if state.capture != nil:
           try:
-            state.capture.appliedCaptureRound(state.sim,
-              (if roundReplayed: newSeq[string](Seats) else: notes),
-              (if roundReplayed: newSeq[string](Seats) else: memos))
+            state.capture.appliedCaptureRound(state.sim, notes, memos)
           except CatchableError as error: state.capture.captureGap(state.sim.round, -1, error.msg)
         for pair in 0 ..< Meetings:
           echo "ledger: round ", state.sim.round + 1, " ",

@@ -468,8 +468,7 @@ proc strictApplied(decision: CapturedDecision, text: string) =
   elif gossip.kind != JNull:
     raise newException(ValueError, "unexpected native gossip for empty/no-target command")
 
-proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
-  if capture == nil: return
+proc recordCapturedDecisions(capture: RuntimeCapture) =
   for round in 0 ..< MaxRounds:
     if not capture.rounds.hasKey(round): continue
     for seat, decision in capture.rounds[round]:
@@ -524,6 +523,10 @@ proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
       capture.trajectory.recordDecision($round & "-" & $seat, $seat, decision.observation,
         attempts, selected, actual, status,
         fallbackOrigin = (if decision.scripted: some("engine-scripted-or-fallback") else: none(string)))
+
+proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
+  if capture == nil: return
+  capture.recordCapturedDecisions()
   var privateOutcome = outcome
   var scores = outcome{"scores"}
   if not scalarJson(outcome):
@@ -532,6 +535,16 @@ proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
     if not scalarJson(scores): scores = newJNull()
   capture.trajectory.finish(if outcome{"reason"}.getStr() == "complete": esCompleted else: esTruncated,
     privateOutcome, scores)
+  if capture.trajectory.eventsJsonl().len > MaxPrivatePayloadBytes:
+    raise newException(ValueError, "serialized private episode exceeds 16 MiB; publication omitted, no truncation")
+  capture.trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
+
+proc failCapture*(capture: RuntimeCapture, failedSeat: int, reason: string) =
+  if capture == nil: return
+  capture.recordCapturedDecisions()
+  let safeReason = safeDiagnostic(reason)
+  let outcome = %*{"failed_policy_index": failedSeat, "message": safeReason}
+  capture.trajectory.finish(esFailed, outcome, newJNull())
   if capture.trajectory.eventsJsonl().len > MaxPrivatePayloadBytes:
     raise newException(ValueError, "serialized private episode exceeds 16 MiB; publication omitted, no truncation")
   capture.trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
