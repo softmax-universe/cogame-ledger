@@ -136,6 +136,15 @@ when isMainModule:
           except CatchableError as error:
             echo "ledger player: round ", roundNum + 1,
               " model decision failed: ", error.msg
+            try:
+              socket.send($ %*{
+                "type": "action_error",
+                "round": roundNum,
+                "error": error.msg
+              })
+              sleep(100)
+            except CatchableError:
+              discard
             exitCode = 1
             break
       of "final":

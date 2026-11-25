@@ -216,7 +216,7 @@ suite "llm plumbing, offline":
     check observation["currentPairs"].len == Meetings
     check not observation.hasKey("memos")
 
-  test "with no credentials every seat is scripted, instantly, over no wire":
+  test "explicit scripted seats run without credentials, while non-scripted seats raise ModelDecisionError":
     putEnv("COWORLD_LLM_ENDPOINT", "")
     putEnv("ANTHROPIC_API_KEY", "")
     putEnv("ANTHROPIC_API_KEY_URI", "")
@@ -233,7 +233,7 @@ suite "llm plumbing, offline":
       seats.add(seat)
     let started = getMonoTime()
     let decisions = client.decideAll(sim, seats,
-      newSeq[string](Seats), newSeq[ScriptKind](Seats))
+      newSeq[string](Seats), halfAndHalf())
     let elapsed = (getMonoTime() - started).inMilliseconds
     check decisions.len == Seats
     for index, decision in decisions:
@@ -242,10 +242,27 @@ suite "llm plumbing, offline":
       let meeting = sim.plan.pairs[pair]
       let first = meeting.a == seats[index]
       check decision.move == clampMove(meeting.game, first, decision.move)
-      ## No credentials means no retries and no network waits at all.
       check decision.note.len == 0
-    echo "decideAll with no credentials: ", elapsed, " ms"
+    echo "decideAll with explicit scripted seats: ", elapsed, " ms"
     check elapsed < 1000
+
+    var withModelSeat = halfAndHalf()
+    withModelSeat[3] = skNone
+    var failedSeat = -1
+    var failedMsg = ""
+    try:
+      discard client.decideAll(sim, seats, newSeq[string](Seats), withModelSeat)
+    except ModelDecisionError as error:
+      failedSeat = error.seat
+      failedMsg = error.msg
+    check failedSeat == 3
+    check "no LLM credentials configured" in failedMsg
+
+    check parseScriptKind("") == skNone
+    check parseScriptKind("mirror") == skMirror
+    check parseScriptKind("shark") == skShark
+    expect LedgerError:
+      discard parseScriptKind("bogus")
 
   test "configured model transport raises ModelDecisionError instead of inventing a move":
     putEnv("COWORLD_LLM_ENDPOINT", "http://127.0.0.1:1")
@@ -308,27 +325,26 @@ suite "llm plumbing, offline":
     check parseDecision(sgUltimatum, true,
       parseJson("""{"move": 40}""")).move == Pie
 
-  test "prose around the object still yields the object":
-    let payload = extractJsonObject(
-      "Let me think about this.\n```json\n{\"move\": \"defect\", " &
-      "\"note\": \"took the pot\"}\n```\nThat is my answer.")
-    let decision = parseDecision(sgDilemma, true, payload)
-    check decision.move == MoveDefect
-    check decision.note == "took the pot"
-    expect LedgerError:
-      discard extractJsonObject("I would rather not answer that.")
-
-  test "canonical single-fence JSON reader accepts bare or single fenced object without inventing actions":
+  test "canonical single-fence JSON reader rejects prose/multiple fences and preserves raw output":
     let bare = parseSingleFencedJson("""{"move": "cooperate", "note": "fair", "memo": "ok"}""")
     check parseDecision(sgDilemma, true, bare).move == MoveCooperate
     let fencedJson = parseSingleFencedJson("```json\n{\"move\": 50, \"note\": \"\", \"memo\": \"\"}\n```")
     check parseDecision(sgTrust, false, fencedJson).move == 50
     let fencedPlain = parseSingleFencedJson("```\n{\"move\": 6}\n```")
     check parseDecision(sgUltimatum, true, fencedPlain).move == 6
-    expect LedgerError:
+    var proseErr = ""
+    try:
       discard parseSingleFencedJson("Here is my answer:\n```json\n{\"move\": 6}\n```")
-    expect LedgerError:
+    except LedgerError as err:
+      proseErr = err.msg
+    check "Here is my answer:" in proseErr
+    var multiErr = ""
+    try:
       discard parseSingleFencedJson("```json\n{\"move\": 6}\n```\n```json\n{\"move\": 4}\n```")
+    except LedgerError as err:
+      multiErr = err.msg
+    check "multiple markdown fences" in multiErr
+    check "\"move\": 4" in multiErr
     expect LedgerError:
       discard parseSingleFencedJson("not json at all")
     expect LedgerError:
