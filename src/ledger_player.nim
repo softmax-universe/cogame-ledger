@@ -35,9 +35,8 @@ zero returns, or lowball offers, defect, send 0 or 1, return 0 to 25 percent,
 and keep your responder floor at 5. As responder, set a floor of 3 or 4 in
 normal play: high enough to deter lowballs, low enough that most offers clear
 it, because a broken deal pays you nothing and a nothing drags your median
-down. Write one short, honest public note about your previous partner every
-round; your notes are part of your reputation too. Keep a memo listing each
-alias, what they did to you, and what you intend to do about it.
+down. Keep any optional note or memo to brief plain text with no markdown or
+backticks.
 """
 
 proc scriptedName(): string =
