@@ -67,6 +67,7 @@ type
     external: seq[bool]
     awaiting: seq[bool]
     actions: seq[JsonNode]
+    actionErrors: seq[string]
     scripted: seq[ScriptKind]
     policyReady: seq[bool]
     playerSockets: Table[int, WebSocket]
@@ -483,6 +484,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           if externalCopy[seat]:
             state.awaiting[seat] = true
             state.actions[seat] = nil
+            state.actionErrors[seat] = ""
             if state.playerSockets.hasKey(seat):
               state.playerSockets[seat].send($ %*{
                 "type": "observation",
@@ -505,17 +507,28 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         failEpisode(runtimeConfig, error.seat, error.msg)
 
       let actionDeadline = epochTime() + config.llmTimeoutSeconds.float
+      var failedExternalSeat = -1
+      var failedExternalReason = ""
       while epochTime() < actionDeadline:
         var waiting = false
         withLock stateLock:
           for seat in seats:
             if externalCopy[seat] and state.actions[seat].isNil:
+              if state.actionErrors[seat].len > 0:
+                failedExternalSeat = seat
+                failedExternalReason = "seat " & $seat & " invalid action: " &
+                  state.actionErrors[seat]
+                break
+              if not state.playerSockets.hasKey(seat):
+                failedExternalSeat = seat
+                failedExternalReason = "seat " & $seat &
+                  " disconnected before submitting action"
+                break
               waiting = true
-        if not waiting:
+        if failedExternalSeat >= 0 or not waiting:
           break
         sleep(20)
 
-      var missedExternalSeat = -1
       withLock stateLock:
         for seat in seats:
           if externalCopy[seat]:
@@ -525,11 +538,15 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               let meeting = state.sim.plan.pairs[pair]
               decisions[seat] = parseDecision(meeting.game,
                 meeting.a == seat, state.actions[seat])
-            elif missedExternalSeat < 0:
-              missedExternalSeat = seat
-      if missedExternalSeat >= 0:
-        failEpisode(runtimeConfig, missedExternalSeat,
-          "seat " & $missedExternalSeat & " missed action deadline")
+            elif failedExternalSeat < 0:
+              failedExternalSeat = seat
+              failedExternalReason =
+                if state.actionErrors[seat].len > 0:
+                  "seat " & $seat & " invalid action: " & state.actionErrors[seat]
+                else:
+                  "seat " & $seat & " missed action deadline"
+      if failedExternalSeat >= 0:
+        failEpisode(runtimeConfig, failedExternalSeat, failedExternalReason)
 
       withLock stateLock:
         var moves: array[Meetings, array[2, int]]
@@ -704,8 +721,12 @@ proc websocketHandler(
               let pair = state.sim.pairIndexOf(state.sim.round, slot)
               let meeting = state.sim.plan.pairs[pair]
               let action = payload["action"]
-              discard parseDecision(meeting.game, meeting.a == slot, action)
-              state.actions[slot] = action
+              try:
+                discard parseDecision(meeting.game, meeting.a == slot, action)
+                state.actions[slot] = action
+              except CatchableError as parseErr:
+                state.actionErrors[slot] = parseErr.msg
+                raise parseErr
         elif payload{"type"}.getStr() == "prompt":
           if not payload.hasKey("prompt") or payload["prompt"].kind != JString:
             raise newException(LedgerError, "prompt must be a string")
@@ -799,6 +820,7 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.external = newSeq[bool](config.players.len)
   state.awaiting = newSeq[bool](config.players.len)
   state.actions = newSeq[JsonNode](config.players.len)
+  state.actionErrors = newSeq[string](config.players.len)
   state.scripted = newSeq[ScriptKind](config.players.len)
   state.policyReady = newSeq[bool](config.players.len)
   runtimeConfigGlobal = runtimeConfig

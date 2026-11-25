@@ -135,7 +135,10 @@ proc newLlmClient*(config: GameConfig, selection: PromptSelection): LlmClient =
   if sidecarEndpoint.len > 0:
     result.transport = ltSidecar
     result.sidecarEndpoint = sidecarEndpoint.strip(chars = {'/'}, leading = false)
-    result.model = getEnv("COWORLD_LLM_MODEL", "anthropic/claude-haiku-4.5")
+    let envModel = getEnv("COWORLD_LLM_MODEL").strip()
+    result.model =
+      if envModel.len > 0: envModel
+      else: "anthropic/claude-haiku-4.5"
     result.curl = newCurly()
     return
   let bedrockEndpoint = getEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME").strip()
@@ -560,6 +563,37 @@ proc singleLine*(text: string): string =
     else:
       result.add($rune)
 
+proc stripSingleMarkdownFence*(text: string): string =
+  ## Strips at most one outer Markdown presentation fence (``` or ```json)
+  ## without tolerating arbitrary surrounding prose or multiple fences.
+  let trimmed = text.strip()
+  if not trimmed.startsWith("```"):
+    return trimmed
+  let firstNewline = trimmed.find('\n')
+  if firstNewline < 0:
+    raise newException(LedgerError, "unterminated markdown fence in response")
+  let info = trimmed[3 ..< firstNewline].strip().toLowerAscii()
+  if info.len > 0 and info != "json":
+    raise newException(LedgerError, "unsupported markdown fence language: " & info)
+  if not trimmed.endsWith("```") or trimmed.len < firstNewline + 4:
+    raise newException(LedgerError, "unclosed markdown fence in response")
+  let inner = trimmed[firstNewline + 1 ..< trimmed.len - 3].strip()
+  if "```" in inner:
+    raise newException(LedgerError, "multiple markdown fences in response")
+  inner
+
+proc parseSingleFencedJson*(text: string): JsonNode =
+  ## Canonical JSON reader: accepts a bare JSON object or a single Markdown
+  ## presentation fence around one JSON object, without inventing actions.
+  let body = stripSingleMarkdownFence(text)
+  if body.len == 0 or body[0] != '{' or body[^1] != '}':
+    raise newException(LedgerError, "response is not a JSON object: " &
+      cleanText(text, 160).replace("\n", " "))
+  let parsed = parseJson(body)
+  if parsed.kind != JObject:
+    raise newException(LedgerError, "response JSON must be an object")
+  parsed
+
 proc extractJsonObject*(text: string): JsonNode =
   ## Pulls the first {...} object out of a model response, tolerating fences
   ## and prose before or after the object.
@@ -798,3 +832,221 @@ proc decideAll*(
       "seat " & $failedSeat & " model decision failed: " & detail)
     err.seat = failedSeat
     raise err
+
+# ---- External player-container LLM client -----------------------------------
+
+proc parseSubGame*(name: string): SubGame =
+  case name.strip().toUpperAscii()
+  of "DILEMMA", "PD": sgDilemma
+  of "TRUST": sgTrust
+  of "ULTIMATUM": sgUltimatum
+  else: raise newException(LedgerError, "unknown subgame: " & name)
+
+proc isFirstRole*(game: SubGame, role: string): bool =
+  let upper = role.strip().toUpperAscii()
+  case game
+  of sgDilemma: true
+  of sgTrust:
+    if upper == "INVESTOR": true
+    elif upper == "TRUSTEE": false
+    else: raise newException(LedgerError, "unknown TRUST role: " & role)
+  of sgUltimatum:
+    if upper == "PROPOSER": true
+    elif upper == "RESPONDER": false
+    else: raise newException(LedgerError, "unknown ULTIMATUM role: " & role)
+
+proc observationSystemPrompt*(obs: JsonNode): string =
+  let alias = obs["name"].getStr()
+  "You are " & alias & ", one of eight cogs in Ledger. Your " &
+    "alias is permanent and public:\neverything you do is on the record " &
+    "and every other cog can read it." & CanonicalRules & ReplyRules
+
+proc obsRulesBlock(partner: string, game: SubGame, first: bool): string =
+  case game
+  of sgDilemma:
+    "You and " & partner & " each choose cooperate or defect at the same " &
+      "time. If you both cooperate you get " & $PdReward & " coins each. " &
+      "If you both defect you get " & $PdPunishment & " each. If you " &
+      "defect while " & partner & " cooperates you get " & $PdTemptation &
+      " and " & partner & " gets " & $PdSucker & "; if you cooperate while " &
+      partner & " defects you get " & $PdSucker & " and " & partner & " gets " &
+      $PdTemptation & "."
+  of sgTrust:
+    if first:
+      "You start with " & $InvestorEndowment & " coins and send some " &
+        "number s of them (0-" & $InvestorEndowment & ") to " & partner &
+        ". Whatever is sent DOUBLES on the way: " & partner & " receives 2s. " &
+        partner & " starts with " & $TrusteeEndowment & " coins and has " &
+        "already committed a return percentage p (0-100): they will return " &
+        "round(2s * p / 100) coins. You end with " & $InvestorEndowment &
+        " - s + returned; " & partner & " ends with " & $TrusteeEndowment &
+        " + 2s - returned."
+    else:
+      partner & " starts with " & $InvestorEndowment & " coins and sends you " &
+        "some number s of them (0-" & $InvestorEndowment & "). Whatever is " &
+        "sent DOUBLES on the way: you receive 2s. You start with " &
+        $TrusteeEndowment & " coins. You commit now to a return percentage " &
+        "p (0-100): you will return round(2s * p / 100) coins. " & partner &
+        " ends with " & $InvestorEndowment & " - s + returned; you end " &
+        "with " & $TrusteeEndowment & " + 2s - returned."
+  of sgUltimatum:
+    if first:
+      "There are " & $Pie & " coins on the table. You offer o of them (0-" &
+        $Pie & ") to " & partner & ". " & partner & " has already committed a " &
+        "minimum acceptable offer m (0-" & $Pie & "). If o is at least m " &
+        "you keep " & $Pie & " - o and " & partner & " gets o; if o is below " &
+        "m the deal breaks and you both get 0."
+    else:
+      "There are " & $Pie & " coins on the table. " & partner & " offers you " &
+        "o of them (0-" & $Pie & "). You commit now to a minimum " &
+        "acceptable offer m (0-" & $Pie & "). If o is at least m you get o " &
+        "and " & partner & " keeps " & $Pie & " - o; if o is below m the deal " &
+        "breaks and you both get 0."
+
+proc obsHistoryBlock(history: JsonNode, alias: string): string =
+  var lines: seq[string]
+  for record in history:
+    let firstAlias = record["first"].getStr()
+    let secondAlias = record["second"].getStr()
+    if firstAlias != alias and secondAlias != alias:
+      continue
+    let isFirst = firstAlias == alias
+    let other = if isFirst: secondAlias else: firstAlias
+    let game = parseSubGame(record["game"].getStr())
+    let move = if isFirst: record["firstMove"].getInt() else: record["secondMove"].getInt()
+    let payMine = if isFirst: record["firstPay"].getInt() else: record["secondPay"].getInt()
+    let payTheirs = if isFirst: record["secondPay"].getInt() else: record["firstPay"].getInt()
+    lines.add("R" & $(record["round"].getInt() + 1) & " vs " & other & " — " &
+      subGameName(game) & " as " & roleName(game, isFirst) & ": " &
+      moveText(game, isFirst, move) & " (" & alias & " +" & $payMine & ", " &
+      other & " +" & $payTheirs & ")")
+  if lines.len == 0:
+    return "(none)"
+  let start = max(0, lines.len - HistoryWindow)
+  lines[start .. ^1].join("\n")
+
+proc observationUserPrompt*(obs: JsonNode, operatorPrompt: string): string =
+  let alias = obs["name"].getStr()
+  let roundNum = obs["round"].getInt()
+  let rounds = obs["rounds"].getInt()
+  let partner = obs["partner"].getStr()
+  let game = parseSubGame(obs["game"].getStr())
+  let role = obs["role"].getStr()
+  let first = isFirstRole(game, role)
+
+  var ownMedian = 0.0
+  var ownMeetings, ownKind, ownHarsh = 0
+  var partnerMedian = 0.0
+  var partnerMeetings, partnerKind, partnerHarsh = 0
+  var tableLines: seq[string]
+  for seat in obs["publicSeats"]:
+    let sName = seat["name"].getStr()
+    let sMedian = seat["median"].getFloat()
+    let sMeetings = seat["meetings"].getInt()
+    let sKind = seat["kind"].getInt()
+    let sHarsh = seat["harsh"].getInt()
+    if sName == alias:
+      ownMedian = sMedian
+      ownMeetings = sMeetings
+      ownKind = sKind
+      ownHarsh = sHarsh
+    if sName == partner:
+      partnerMedian = sMedian
+      partnerMeetings = sMeetings
+      partnerKind = sKind
+      partnerHarsh = sHarsh
+    tableLines.add(sName & " — median " & coins(sMedian) & ", " &
+      $sMeetings & " meetings, kind " & $sKind & " / harsh " & $sHarsh)
+
+  result.add("Round " & $(roundNum + 1) & " of " & $rounds &
+    ". You are " & alias & ". Your median so far: " &
+    coins(ownMedian) & " coins over " & $ownMeetings &
+    " meetings (kind " & $ownKind & " / harsh " & $ownHarsh & ").\n\n")
+
+  result.add("THIS MEETING: " & partner & " — " & subGameName(game) & ".\n")
+  result.add("YOUR ROLE: " & role &
+    (if game == sgDilemma: " (you both decide at the same time)."
+     elif first: " (first mover)." else: " (second mover).") & "\n")
+  result.add("THE RULES OF THIS MEETING: " &
+    obsRulesBlock(partner, game, first) & "\n\n")
+
+  result.add("PARTNER RECORD — " & partner & ": median " &
+    coins(partnerMedian) & " coins over " & $partnerMeetings &
+    " meetings, kind " & $partnerKind & " / harsh " & $partnerHarsh & ".\n")
+  result.add("THEIR LAST " & $HistoryWindow & " MEETINGS:\n" &
+    obsHistoryBlock(obs["publicHistory"], partner) & "\n\n")
+
+  result.add("THE TABLE:\n" & tableLines.join("\n") & "\n\n")
+
+  var tables: seq[string]
+  for pairing in obs["currentPairs"]:
+    tables.add(pairing["first"].getStr() & " & " & pairing["second"].getStr() &
+      " — " & pairing["game"].getStr())
+  result.add("THIS ROUND'S TABLES: " & tables.join(" · ") & "\n\n")
+
+  result.add("YOUR LAST " & $HistoryWindow & " MEETINGS:\n" &
+    obsHistoryBlock(obs["publicHistory"], alias) & "\n\n")
+
+  var notes: seq[string]
+  for note in obs["gossip"]:
+    notes.add("R" & $(note["round"].getInt() + 1) & " " &
+      note["author"].getStr() & " on " & note["subject"].getStr() &
+      ": \"" & note["text"].getStr() & "\"")
+  result.add("THE GOSSIP BOARD (last " & $GossipWindow & " notes):\n" &
+    (if notes.len > 0: notes.join("\n") else: "(none)") & "\n\n")
+
+  let memo = obs{"memo"}.getStr()
+  result.add("YOUR PRIVATE MEMO:\n" &
+    (if memo.len > 0: memo else: "(none)") & "\n\n")
+
+  let noteTarget = obs{"noteTarget"}
+  if noteTarget != nil and noteTarget.kind == JString and noteTarget.getStr().len > 0:
+    let targetName = noteTarget.getStr()
+    result.add("NOTE TARGET: " & targetName & " (your partner last round) — " &
+      "your \"note\" is a public review of " & targetName & ".\n\n")
+  else:
+    result.add("NOTE TARGET: (none this round — any \"note\" you send is " &
+      "discarded).\n\n")
+
+  result.add(operatorBlock(operatorPrompt))
+  result.add("Reply with ONLY {\"move\": " & moveExample(game, first) &
+    ", \"note\": \"…\", \"memo\": \"…\"} — \"move\" is " &
+    legalForm(game, first) & "; note at most " & $MaxNoteLen &
+    " characters; memo at most " & $MaxMemoLen & " characters.")
+
+proc newPlayerLlmClient*(): LlmClient =
+  ## Strict learner-container LLM client: requires configured credentials,
+  ## uses a single model without fallback or retries.
+  var config = defaultGameConfig()
+  let envMaxTokens = getEnv("PLAYER_MAX_OUTPUT_TOKENS").strip()
+  if envMaxTokens.len > 0:
+    config.maxOutputTokens = parseInt(envMaxTokens)
+  let envTimeout = getEnv("PLAYER_TIMEOUT_SECONDS").strip()
+  if envTimeout.len > 0:
+    config.llmTimeoutSeconds = parseInt(envTimeout)
+  let envModel = getEnv("PLAYER_MODEL").strip()
+  if envModel.len > 0:
+    config.model = envModel
+  result = newLlmClient(config, PromptSelection())
+  if result.disabled or result.transport == ltNone:
+    raise newException(LedgerError,
+      "no LLM credentials configured for model player (set COWORLD_LLM_ENDPOINT, ANTHROPIC_API_KEY, or Bedrock credentials)")
+  if result.transport == ltBedrock and result.bedrockModels.len > 1:
+    result.bedrockModels = @[result.bedrockModels[0]]
+
+proc chooseExternalModelAction*(client: LlmClient, obs: JsonNode,
+    operatorPrompt: string, slot: int): Decision =
+  ## Issues a single LLM call from the learner container and parses the reply
+  ## without retries or scripted fallback.
+  let game = parseSubGame(obs["game"].getStr())
+  let first = isFirstRole(game, obs["role"].getStr())
+  let system = observationSystemPrompt(obs)
+  let user = observationUserPrompt(obs, operatorPrompt)
+  let req = client.requestFor(system, user, slot)
+  var batch: RequestBatch
+  batch.post(req.url, req.headers, req.body, "0")
+  let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
+  let text = client.textOf(responses[0].response, responses[0].error, req.url)
+  let payload = parseSingleFencedJson(text)
+  result = parseDecision(game, first, payload)
+  result.scripted = false
