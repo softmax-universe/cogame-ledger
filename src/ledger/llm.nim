@@ -1001,10 +1001,11 @@ proc observationUserPrompt*(obs: JsonNode, operatorPrompt: string): string =
       "discarded).\n\n")
 
   result.add(operatorBlock(operatorPrompt))
-  result.add("Reply with ONLY {\"move\": " & moveExample(game, first) &
-    ", \"note\": \"…\", \"memo\": \"…\"} — \"move\" is " &
-    legalForm(game, first) & "; note at most " & $MaxNoteLen &
-    " characters; memo at most " & $MaxMemoLen & " characters.")
+  result.add("Reply with a single raw JSON object only (no markdown fences or extra text): " &
+    "{\"move\": " & moveExample(game, first) & "} " &
+    "(optional plain-text \"note\" <= " & $MaxNoteLen & " chars, " &
+    "optional plain-text \"memo\" <= " & $MaxMemoLen & " chars). " &
+    "\"move\" is " & legalForm(game, first) & ".")
 
 proc newPlayerLlmClient*(): LlmClient =
   ## Strict learner-container LLM client: requires configured credentials,
