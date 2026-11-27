@@ -690,7 +690,9 @@ proc playerUpgradeHandler(request: Request) {.gcsafe.} =
         "protocol": "ledger.player.v2",
         "slot": slot,
         "name": state.sim.names[slot],
-        "rounds": state.config.rounds
+        "rounds": state.config.rounds,
+        "maxOutputTokens": state.config.maxOutputTokens,
+        "llmTimeoutSeconds": state.config.llmTimeoutSeconds
       })
 
 proc globalUpgradeHandler(request: Request) {.gcsafe.} =

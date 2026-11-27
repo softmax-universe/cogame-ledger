@@ -1007,16 +1007,10 @@ proc observationUserPrompt*(obs: JsonNode, operatorPrompt: string): string =
     "optional plain-text \"memo\" <= " & $MaxMemoLen & " chars). " &
     "\"move\" is " & legalForm(game, first) & ".")
 
-proc newPlayerLlmClient*(): LlmClient =
+proc newPlayerLlmClient*(episode: GameConfig): LlmClient =
   ## Strict learner-container LLM client: requires configured credentials,
   ## uses a single model without fallback or retries.
-  var config = defaultGameConfig()
-  let envMaxTokens = getEnv("PLAYER_MAX_OUTPUT_TOKENS").strip()
-  if envMaxTokens.len > 0:
-    config.maxOutputTokens = parseInt(envMaxTokens)
-  let envTimeout = getEnv("PLAYER_TIMEOUT_SECONDS").strip()
-  if envTimeout.len > 0:
-    config.llmTimeoutSeconds = parseInt(envTimeout)
+  var config = episode
   let envModel = getEnv("PLAYER_MODEL").strip()
   if envModel.len > 0:
     config.model = envModel

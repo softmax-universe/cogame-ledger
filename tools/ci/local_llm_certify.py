@@ -83,7 +83,7 @@ def make_handler(calls: list[dict], calls_log: Path | None = None):
                 return
 
             reply_text = choose_deterministic_reply(user_text)
-            record = {"path": self.path, "slot": slot, "model": model}
+            record = {"path": self.path, "slot": slot, "model": model, "max_tokens": body["max_tokens"]}
             with lock:
                 calls.append(record)
                 if calls_log is not None:
