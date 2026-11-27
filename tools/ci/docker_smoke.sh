@@ -158,6 +158,7 @@ if str(seats_expected).isdigit() and int(seats_expected) != seats:
 players = list(fixture_players)
 while len(players) < seats:
     players.append({"name": f"smoke-{len(players)}"})
+config["maxOutputTokens"] = 731
 config["players"] = players[:seats]
 config["tokens"] = [f"token-{i}" for i in range(seats)]
 
@@ -353,6 +354,7 @@ if not log_path.exists():
 calls = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
 if not calls:
     raise SystemExit("FAIL: local LLM fixture received 0 HTTP /v1/messages calls")
+assert all(c["max_tokens"] == 731 for c in calls), calls
 seen_models = {c.get("model") for c in calls if c.get("model")}
 if expected_models and not (seen_models & expected_models):
     raise SystemExit(f"FAIL: expected model(s) {sorted(expected_models)}, saw {sorted(seen_models)}")

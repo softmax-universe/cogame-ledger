@@ -366,7 +366,7 @@ suite "llm plumbing, offline":
     putEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "")
     putEnv("AWS_BEARER_TOKEN_BEDROCK", "")
     expect LedgerError:
-      discard newPlayerLlmClient()
+      discard newPlayerLlmClient(defaultGameConfig())
 
   test "note and memo are truncated on rune boundaries and stay one line":
     var long = ""

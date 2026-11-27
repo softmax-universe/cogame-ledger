@@ -23,7 +23,7 @@
 import
   std/[json, options, os, strutils],
   whisky,
-  ledger/llm
+  ledger/[llm, types]
 
 const DefaultPrompt = """
 Your score is the MEDIAN of your per-meeting payoffs, so aim to be reliably
@@ -84,6 +84,7 @@ when isMainModule:
   echo "ledger player: connecting to game"
   let socket = newWebSocket(url)
   var slot = -1
+  var modelConfig = defaultGameConfig()
   var llmClient: LlmClient = nil
 
   ## whisky's receiveMessage RAISES on a close frame or a truncated read
@@ -108,6 +109,8 @@ when isMainModule:
         echo "ledger player: seated at slot ", slot,
           " as ", payload{"name"}.getStr()
         if containerModelMode:
+          modelConfig.maxOutputTokens = payload{"maxOutputTokens"}.getInt(modelConfig.maxOutputTokens)
+          modelConfig.llmTimeoutSeconds = payload{"llmTimeoutSeconds"}.getInt(modelConfig.llmTimeoutSeconds)
           socket.send($ %*{"type": "register", "control": "external"})
           echo "ledger player: registered external model control"
         else:
@@ -119,7 +122,7 @@ when isMainModule:
           let roundNum = payload["round"].getInt()
           try:
             if llmClient.isNil:
-              llmClient = newPlayerLlmClient()
+              llmClient = newPlayerLlmClient(modelConfig)
             let decision = chooseExternalModelAction(
               llmClient, payload["observation"], prompt, slot
             )
